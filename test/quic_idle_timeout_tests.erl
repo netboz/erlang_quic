@@ -100,3 +100,23 @@ just_below_timeout_boundary_test() ->
     TimeSinceActivity = Now - LastActivity,
 
     ?assertNot(TimeSinceActivity >= IdleTimeout).
+
+%%====================================================================
+%% RFC 9000 Section 10.1 anti-black-hole send guard (send_activity/4)
+%%====================================================================
+
+%% Only the FIRST ack-eliciting packet since our last receive advances
+%% last_activity; every later send (and any non-ack-eliciting packet) leaves it
+%% frozen, so an endpoint that keeps sending into a silent peer still times out.
+send_activity_black_hole_test() ->
+    LA0 = 1000,
+    %% first ack-eliciting send since a receive: restart last_activity, arm the guard
+    ?assertEqual({2000, true}, quic_connection:send_activity(true, false, 2000, LA0)),
+    %% subsequent ack-eliciting sends while the guard is set: last_activity FROZEN
+    %% (this is the fix: a black-holed connection is no longer kept alive by our sends)
+    ?assertEqual({LA0, true}, quic_connection:send_activity(true, true, 3000, LA0)),
+    ?assertEqual({LA0, true}, quic_connection:send_activity(true, true, 999999, LA0)),
+    %% a non-ack-eliciting packet (e.g. a pure ACK) never advances last_activity
+    %% and never arms the guard on its own
+    ?assertEqual({LA0, false}, quic_connection:send_activity(false, false, 5000, LA0)),
+    ?assertEqual({LA0, true}, quic_connection:send_activity(false, true, 5000, LA0)).

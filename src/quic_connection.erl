@@ -139,6 +139,7 @@
 %% Test exports
 -ifdef(TEST).
 -export([
+    send_activity/4,
     chunk_crypto/3,
     add_to_ack_ranges/2,
     merge_ack_ranges/1,
@@ -452,6 +453,12 @@
     %% Timers
     idle_timeout :: non_neg_integer(),
     last_activity :: non_neg_integer(),
+    %% RFC 9000 Sec 10.1 anti-black-hole guard: true once we have sent an
+    %% ack-eliciting packet since our last RECEIVED packet. While true, further
+    %% sends do NOT advance last_activity, so an endpoint cannot keep a dead
+    %% connection alive indefinitely by only sending into it (the idle timer
+    %% then fires ~idle_timeout after the peer goes silent). Reset on every receive.
+    sent_ack_eliciting_since_recv = false :: boolean(),
     timer_ref :: reference() | undefined,
 
     %% Congestion control and loss detection
@@ -3541,13 +3548,22 @@ send_app_packet_internal(Payload, Frames, State) ->
                     undefined -> State#state.socket_state;
                     _ -> NewSocketState
                 end,
+            %% RFC 9000 Sec 10.1: restart the idle timer on send ONLY for the first
+            %% ack-eliciting packet since our last receive (see send_activity/4), so
+            %% a peer we keep sending to but never hear back from still times out
+            %% ~idle_timeout after it went silent.
+            {NewLastActivity, NewSentAckElicit} = send_activity(
+                AckEliciting, State#state.sent_ack_eliciting_since_recv, Now,
+                State#state.last_activity
+            ),
             maybe_force_key_update(State#state{
                 pn_app = NewPNSpace,
                 cc_state = NewCCState,
                 loss_state = NewLossState,
                 packets_sent = State#state.packets_sent + 1,
                 socket_state = EffectiveSocketState,
-                last_activity = Now,
+                last_activity = NewLastActivity,
+                sent_ack_eliciting_since_recv = NewSentAckElicit,
                 pto_dirty = true
             });
         {error, Reason, ClearedSocketState} ->
@@ -7173,9 +7189,22 @@ merge_ack_ranges(Ranges) ->
 update_last_activity(State) ->
     update_last_activity(State, erlang:monotonic_time(millisecond)).
 
-%% Now-accepting variant used by the receive hot path.
+%% Now-accepting variant used by the receive hot path. Receiving a packet both
+%% advances last_activity AND clears the RFC 9000 Sec 10.1 guard, so the next
+%% ack-eliciting send is again allowed to restart the idle timer.
 update_last_activity(State, Now) ->
-    State#state{last_activity = Now}.
+    State#state{last_activity = Now, sent_ack_eliciting_since_recv = false}.
+
+%% RFC 9000 Sec 10.1 anti-black-hole decision for the send path (extracted so it
+%% can be unit-tested). Given whether the packet just sent is ack-eliciting, whether
+%% we have already sent an ack-eliciting packet since our last receive, the current
+%% time and the current last_activity, return `{NewLastActivity, NewSentFlag}`.
+%% Only the FIRST ack-eliciting packet since a receive advances last_activity; any
+%% later send (or a non-ack-eliciting packet, e.g. a pure ACK) leaves it frozen, so
+%% an endpoint cannot keep a silent peer's connection alive by only sending into it.
+send_activity(true, false, Now, _LastActivity) -> {Now, true};
+send_activity(true, true, _Now, LastActivity)  -> {LastActivity, true};
+send_activity(false, Sent, _Now, LastActivity) -> {LastActivity, Sent}.
 
 %% Flush the deferred PTO timer reset at batch boundaries. The idle and
 %% keep-alive timers are lazy (armed once, re-armed only on fire), so the
