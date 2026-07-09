@@ -140,6 +140,7 @@
 -ifdef(TEST).
 -export([
     send_activity/4,
+    calculate_keep_alive_interval/2,
     chunk_crypto/3,
     add_to_ack_ranges/2,
     merge_ack_ranges/1,
@@ -222,6 +223,12 @@
 %% Stays well below the RFC 9002 minimum PTO so it does not break
 %% retransmission semantics.
 -define(PTO_RESET_TOLERANCE_MS, 2).
+
+%% Minimum keep-alive interval (ms). A policy floor that only guards against
+%% sub-RTT / pathological values; the WAN/battery reasons other stacks keep this
+%% at seconds do not apply on a trusted low-RTT LAN, where sub-second liveness
+%% probing gives fast, reliable dead-peer detection. Was hardcoded at 5000.
+-define(KEEP_ALIVE_MIN_MS, 250).
 
 %% ACK packet tolerance for 1-RTT (RFC 9002 §6.2).
 %% The receiver SHOULD send an ACK frame in response to at least every
@@ -2432,15 +2439,20 @@ handle_common_event(
     Now = erlang:monotonic_time(millisecond),
     case (Now - State#state.last_activity) < State#state.keep_alive_interval of
         true ->
-            %% Activity since the timer was armed: re-arm for the remainder,
-            %% no PING needed.
+            %% Activity (a receive, or the first send since one) within the last
+            %% interval: re-arm for the remainder off last_activity, no PING needed.
             {keep_state, set_keep_alive_timer(State#state{keep_alive_timer = undefined})};
         false ->
-            %% Idle for a full interval: send a PING (which refreshes
-            %% last_activity via the send path) and re-arm a full interval.
+            %% Quiet for a full interval: send a PING and re-arm a FULL interval
+            %% from now. We must NOT re-arm off last_activity here: the RFC 9000
+            %% Sec 10.1 guard (send_activity/4) freezes last_activity after the
+            %% first ack-eliciting send, so on a black-holed peer a last_activity
+            %% derived delay computes 0 and busy-loops (send_after(0) -> PING ...).
+            %% A fixed full-interval re-arm bounds PINGs to one per interval until
+            %% the idle timer closes the connection.
             State1 = send_keep_alive_ping(State#state{keep_alive_timer = undefined}),
             State2 = flush_dirty_timers(flush_socket_batch(State1)),
-            {keep_state, set_keep_alive_timer(State2)}
+            {keep_state, rearm_keep_alive_full(State2)}
     end;
 handle_common_event(info, {keep_alive_timeout, _StaleRef}, _StateName, State) ->
     %% Ignore stale keep-alive timer (ref doesn't match or wrong state)
@@ -9498,9 +9510,9 @@ calculate_keep_alive_interval(Opts, IdleTimeout) ->
         disabled -> disabled;
         0 -> disabled;
         auto when IdleTimeout =:= 0 -> disabled;
-        auto -> max(5000, IdleTimeout div 2);
-        Interval when is_integer(Interval), Interval >= 5000 -> Interval;
-        Interval when is_integer(Interval) -> 5000
+        auto -> max(?KEEP_ALIVE_MIN_MS, IdleTimeout div 2);
+        Interval when is_integer(Interval), Interval >= ?KEEP_ALIVE_MIN_MS -> Interval;
+        Interval when is_integer(Interval) -> ?KEEP_ALIVE_MIN_MS
     end.
 
 %% Set keep-alive timer
@@ -9521,6 +9533,19 @@ set_keep_alive_timer(
     Delay = max(0, (LastActivity + Interval) - Now),
     Ref = make_ref(),
     erlang:send_after(Delay, self(), {keep_alive_timeout, Ref}),
+    State#state{keep_alive_timer = Ref}.
+
+%% Re-arm the keep-alive timer a FULL interval from now, independent of
+%% last_activity. Used right after sending a keep-alive PING: because the RFC 9000
+%% Sec 10.1 guard freezes last_activity on repeated ack-eliciting sends, arming off
+%% last_activity (as set_keep_alive_timer does) would compute a 0 delay and busy-loop
+%% on a black-holed peer. A fixed full-interval delay keeps PINGs to one per interval.
+rearm_keep_alive_full(#state{keep_alive_interval = disabled} = State) ->
+    State#state{keep_alive_timer = undefined};
+rearm_keep_alive_full(#state{keep_alive_interval = Interval, keep_alive_timer = OldTimer} = State) ->
+    cancel_timer(OldTimer),
+    Ref = make_ref(),
+    erlang:send_after(Interval, self(), {keep_alive_timeout, Ref}),
     State#state{keep_alive_timer = Ref}.
 
 %%====================================================================

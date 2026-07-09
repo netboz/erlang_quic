@@ -120,3 +120,25 @@ send_activity_black_hole_test() ->
     %% and never arms the guard on its own
     ?assertEqual({LA0, false}, quic_connection:send_activity(false, false, 5000, LA0)),
     ?assertEqual({LA0, true}, quic_connection:send_activity(false, true, 5000, LA0)).
+
+%%====================================================================
+%% Keep-alive interval clamp (sub-second liveness on trusted LANs)
+%%====================================================================
+
+%% keep_alive_interval is clamped up to KEEP_ALIVE_MIN_MS (250), NOT the old 5000,
+%% so a low-RTT LAN can probe sub-second for fast dead-peer detection. disabled/0
+%% stay disabled; auto = idle/2 floored at the minimum; the min applies only to
+%% pathological sub-250 values.
+calculate_keep_alive_interval_clamp_test() ->
+    C = fun(V, Idle) -> quic_connection:calculate_keep_alive_interval(#{keep_alive_interval => V}, Idle) end,
+    ?assertEqual(disabled, C(disabled, 2000)),
+    ?assertEqual(disabled, C(0, 2000)),
+    ?assertEqual(500, C(500, 2000)),                 %% sub-5000 now PASSES (was silently raised to 5000)
+    ?assertEqual(250, C(250, 2000)),                 %% exactly at the floor
+    ?assertEqual(250, C(100, 2000)),                 %% below the floor -> clamped up to 250 (not 5000)
+    ?assertEqual(7000, C(7000, 30000)),              %% large explicit value passes through
+    %% auto = max(min, idle/2); default (key absent) is disabled
+    ?assertEqual(1000, quic_connection:calculate_keep_alive_interval(#{keep_alive_interval => auto}, 2000)),
+    ?assertEqual(250, quic_connection:calculate_keep_alive_interval(#{keep_alive_interval => auto}, 400)),
+    ?assertEqual(disabled, quic_connection:calculate_keep_alive_interval(#{keep_alive_interval => auto}, 0)),
+    ?assertEqual(disabled, quic_connection:calculate_keep_alive_interval(#{}, 2000)).
