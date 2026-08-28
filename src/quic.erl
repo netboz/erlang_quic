@@ -24,7 +24,7 @@
 %%%   <li>`{quic, Conn, {stop_sending, StreamId, ErrorCode}}' - Stop sending</li>
 %%%   <li>`{quic, Conn, {goaway, LastStreamId, ErrorCode, Debug}}' - GoAway received</li>
 %%%   <li>`{quic, Conn, {session_ticket, Ticket}}' - Session ticket for 0-RTT</li>
-%%%   <li>`{quic, Conn, {send_ready, StreamId}}' - Stream ready to write</li>
+%%%   <li>`{quic, Conn, {send_ready, StreamId}}' - The exact previously refused synchronous send may be retried</li>
 %%%   <li>`{quic, Conn, {timer, NextTimeoutMs}}' - Timer notification</li>
 %%%   <li>`{quic, Conn, {datagram, Data}}' - Datagram received (RFC 9221)</li>
 %%%   <li>`{quic, Conn, {stream_deadline, StreamId}}' - Stream deadline expired</li>
@@ -386,6 +386,8 @@ open_unidirectional_stream(Conn) when is_pid(Conn) ->
 
 %% @doc Send data on a stream.
 %% Fin indicates if this is the final frame on the stream.
+%% A request larger than the transport's existing send-queue capacity is
+%% rejected atomically as `{error, send_too_large}` before any bytes are sent.
 -spec send_data(Conn, StreamId, Data, Fin) -> ok | {error, term()} when
     Conn :: pid(),
     StreamId :: non_neg_integer(),

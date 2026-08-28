@@ -175,6 +175,8 @@
     test_coalesce_small_stream/1,
     %% Regression helper for zero-byte FIN entries stranded in the send queue
     test_zero_byte_fin_in_queue/0,
+    %% Edge-precise synchronous-send readiness state machine
+    test_send_ready_transitions/0,
     %% Test helpers for 1-RTT ACK decimation (RFC 9002 §6.2)
     test_decimate_initial_state/0,
     test_decimate_step/1,
@@ -510,6 +512,10 @@
     send_queue_count = 0 :: non_neg_integer(),
     %% Send queue version counter (for fast change detection)
     send_queue_version = 0 :: non_neg_integer(),
+    %% Streams whose synchronous send_data caller was refused before emitting
+    %% bytes. Retain the requested size so send_ready is emitted only when the
+    %% current serialized state can accept that exact retry.
+    blocked_send_streams = #{} :: #{non_neg_integer() => non_neg_integer()},
 
     %% Receive buffer byte tracking (protects against malicious peers)
     recv_buffer_bytes = 0 :: non_neg_integer(),
@@ -1948,10 +1954,16 @@ connected({call, From}, {send_data, StreamId, Data, Fin}, State) ->
     case do_send_data(StreamId, Data, Fin, State) of
         {ok, NewState} ->
             %% Event-driven flush: flush batch and timers after user API call
-            FlushedState = flush_dirty_timers(flush_socket_batch(NewState)),
+            State1 = clear_blocked_send(StreamId, NewState),
+            FlushedState = flush_dirty_timers(flush_socket_batch(State1)),
             {keep_state, FlushedState, [{reply, From, ok}]};
         {error, Reason} ->
-            {keep_state, State, [{reply, From, {error, Reason}}]}
+            State1 =
+                case transient_send_refusal(Reason) of
+                    true -> mark_blocked_send(StreamId, iolist_size(Data), State);
+                    false -> clear_blocked_send(StreamId, State)
+                end,
+            {keep_state, State1, [{reply, From, {error, Reason}}]}
     end;
 connected({call, From}, open_stream, State) ->
     case do_open_stream(State) of
@@ -2900,6 +2912,70 @@ notify_owner(Msg, #state{owner = Owner, conn_ref = Ref}) when is_pid(Owner) ->
 notify_owner(_Msg, _State) ->
     ok.
 
+transient_send_refusal({flow_control_blocked, _}) -> true;
+transient_send_refusal(send_queue_full) -> true;
+transient_send_refusal(_) -> false.
+
+mark_blocked_send(StreamId, Bytes,
+                  #state{blocked_send_streams = Blocked} = State) ->
+    %% A stream owner serializes sends. Preserve its first refused head until
+    %% the corresponding edge; a later caller must not overtake it.
+    case maps:is_key(StreamId, Blocked) of
+        true -> State;
+        false ->
+            State#state{
+              blocked_send_streams = Blocked#{StreamId => Bytes}}
+    end.
+
+clear_blocked_send(StreamId,
+                   #state{blocked_send_streams = Blocked} = State) ->
+    State#state{blocked_send_streams = maps:remove(StreamId, Blocked)}.
+
+blocked_send_ready(StreamId, Bytes,
+                   #state{max_data_remote = MaxDataRemote,
+                          data_sent = DataSent,
+                          streams = Streams,
+                          send_queue_bytes = QueueBytes}) ->
+    case maps:find(StreamId, Streams) of
+        {ok, #stream_state{send_offset = Offset,
+                           send_max_data = SendMaxData}} ->
+            Bytes =< MaxDataRemote - DataSent andalso
+            Bytes =< SendMaxData - Offset andalso
+            Bytes =< ?MAX_SEND_QUEUE_BYTES - QueueBytes;
+        error ->
+            false
+    end.
+
+%% Edge-triggered owner wake. Partition before notifying: a retry that races
+%% another accepted send and is refused again re-registers in the next
+%% serialized send_data call. Unready streams remain registered; unrelated ACK
+%% or credit progress cannot create retry churn above QUIC.
+wake_blocked_sends(
+  #state{blocked_send_streams = Blocked, owner = Owner} = State)
+  when is_pid(Owner) ->
+    {Ready, Waiting} =
+        maps:fold(
+          fun(StreamId, Bytes, {Ready0, Waiting0}) ->
+              case blocked_send_ready(StreamId, Bytes, State) of
+                  true -> {Ready0#{StreamId => Bytes}, Waiting0};
+                  false -> {Ready0, Waiting0#{StreamId => Bytes}}
+              end
+          end,
+          {#{}, #{}},
+          Blocked),
+    maps:foreach(
+      fun(StreamId, _Bytes) ->
+          %% send_ready is a normal connected-stream event and therefore uses
+          %% the live connection pid, exactly like stream_data/stream_reset.
+          %% notify_owner/2 deliberately uses conn_ref for pre-connected TLS
+          %% errors and is not the public event identity.
+          Owner ! {quic, self(), {send_ready, StreamId}}
+      end,
+      Ready),
+    State#state{blocked_send_streams = Waiting};
+wake_blocked_sends(State) ->
+    State.
+
 send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
     #state{
         scid = SCID,
@@ -3345,12 +3421,12 @@ dequeue_small_stream_frame_tuple(
             %% the counter leaks until it crosses ?MAX_SEND_QUEUE_BYTES.
             {{value, _}, NewPQ} = pqueue_out(PQ),
             StreamFrameTuple = {stream, StreamId, Offset, Data, Fin},
-            NewState = State#state{
+            NewState = wake_blocked_sends(State#state{
                 send_queue = NewPQ,
                 send_queue_bytes = max(0, QueueBytes - DataSize),
                 send_queue_count = max(0, QueueCount - 1),
                 send_queue_version = Version + 1
-            },
+            }),
             {ok, StreamFrameTuple, NewState};
         _ ->
             none
@@ -4557,8 +4633,9 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
                     %% now acked.
                     State7 = flush_deferred_retransmits(State6),
                     State8 = complete_send_reset_at(State7),
+                    State9 = wake_blocked_sends(State8),
                     %% Event-driven flush: flush batch and timers after ACK processing
-                    flush_dirty_timers(flush_socket_batch(State8))
+                    flush_dirty_timers(flush_socket_batch(State9))
                 %% close inner case (on_ack_received)
             end
         %% close outer case (Ranges)
@@ -4602,8 +4679,9 @@ process_frame(app, {max_data, MaxData}, #state{max_data_remote = Current} = Stat
             %% Limit increased - try to drain queued data
             State1 = State#state{max_data_remote = MaxData},
             State2 = process_send_queue(State1),
+            State3 = wake_blocked_sends(State2),
             %% Event-driven flush: flush batch and timers after flow control opens
-            flush_dirty_timers(flush_socket_batch(State2));
+            flush_dirty_timers(flush_socket_batch(State3));
         false ->
             %% Monotonic: ignore if not increasing (per RFC 9000)
             State
@@ -4633,8 +4711,9 @@ process_frame(app, {max_stream_data, StreamId, MaxData}, #state{streams = Stream
                     State1 = State#state{streams = maps:put(StreamId, NewStream, Streams)},
                     %% Limit increased - try to drain queued data
                     State2 = process_send_queue(State1),
+                    State3 = wake_blocked_sends(State2),
                     %% Event-driven flush: flush batch and timers after stream flow control opens
-                    flush_dirty_timers(flush_socket_batch(State2));
+                    flush_dirty_timers(flush_socket_batch(State3));
                 false ->
                     %% Monotonic: ignore if not increasing
                     State
@@ -4913,12 +4992,14 @@ process_frame(
                         remove_stream_from_queue(StreamId, State#state.send_queue),
                     NewQueueBytes = max(0, State#state.send_queue_bytes - RemovedBytes),
                     NewQueueCount = max(0, State#state.send_queue_count - RemovedCount),
-                    State#state{
+                    wake_blocked_sends(
+                      clear_blocked_send(
+                        StreamId,
+                        State#state{
                         streams = NewStreams,
                         send_queue = NewSendQueue,
                         send_queue_bytes = NewQueueBytes,
-                        send_queue_count = NewQueueCount
-                    }
+                        send_queue_count = NewQueueCount}))
             end
     end;
 %% STREAM_DATA_BLOCKED: Peer is blocked by stream-level flow control
@@ -7242,7 +7323,9 @@ maybe_reclaim_stream(StreamId, #state{streams = Streams, role = Role} = State) -
                     State;
                 true ->
                     cancel_stream_deadline_timer(Stream),
-                    State1 = State#state{streams = maps:remove(StreamId, Streams)},
+                    State1 = clear_blocked_send(
+                               StreamId,
+                               State#state{streams = maps:remove(StreamId, Streams)}),
                     State2 = record_reclaimed(StreamId, Role, State1),
                     credit_peer_on_reclaim(StreamId, Role, State2)
             end
@@ -7310,11 +7393,11 @@ cancel_stream_deadline_timer(#stream_state{deadline_timer = Timer}) ->
 purge_stream_send_queue(StreamId, State) ->
     {NewQueue, RemovedBytes, RemovedCount} =
         remove_stream_from_queue(StreamId, State#state.send_queue),
-    State#state{
+    wake_blocked_sends(clear_blocked_send(StreamId, State#state{
         send_queue = NewQueue,
         send_queue_bytes = max(0, State#state.send_queue_bytes - RemovedBytes),
         send_queue_count = max(0, State#state.send_queue_count - RemovedCount)
-    }.
+    })).
 
 %%====================================================================
 %% Reclaimed-stream tracking (RFC 9000 §2.1: stream ids never reused)
@@ -7608,10 +7691,22 @@ can_send_on_stream(StreamId, State) ->
 
 %% Send data on a stream (with fragmentation for large data)
 %% Now includes flow control checks at connection and stream level
-do_send_data(
+do_send_data(StreamId, Data, Fin, State) ->
+    %% A synchronous call larger than the transport's existing queue owner can
+    %% never be retried atomically. Reject it permanently before flow-control
+    %% checks (and before any packet emission), so it is never registered for a
+    %% send_ready edge that cannot occur.
+    DataSize = iolist_size(Data),
+    case DataSize =< ?MAX_SEND_QUEUE_BYTES of
+        true -> do_send_data_fitting(StreamId, Data, Fin, DataSize, State);
+        false -> {error, send_too_large}
+    end.
+
+do_send_data_fitting(
     StreamId,
     Data,
     Fin,
+    DataSize,
     #state{
         streams = Streams,
         max_data_remote = MaxDataRemote,
@@ -7628,9 +7723,6 @@ do_send_data(
                     ),
                     {error, stream_state_error};
                 true ->
-                    %% Use iolist_size to avoid premature flattening
-                    %% Data is only flattened when needed for chunking or frame encoding
-                    DataSize = iolist_size(Data),
                     Offset = StreamState#stream_state.send_offset,
                     SendMaxData = StreamState#stream_state.send_max_data,
 
@@ -7692,44 +7784,58 @@ do_send_data(
                             _FinalState = send_frame(BlockedFrame, State),
                             {error, {flow_control_blocked, {stream, StreamId}}};
                         {true, true} ->
-                            %% Flow control allows sending
-                            %% Fragment and send data - congestion control may partially
-                            %% send and queue the remainder
-                            case
-                                send_stream_data_fragmented_tracked(
-                                    StreamId, Offset, Data, Fin, State
-                                )
-                            of
-                                {error, send_queue_full} ->
+                            %% Admit the whole synchronous call before emitting
+                            %% any stream bytes. Its worst-case queued remainder
+                            %% is no larger than DataSize, so this reservation
+                            %% makes send_queue_full an atomic, safely retryable
+                            %% pre-send refusal rather than a partial write.
+                            case DataSize =<
+                                 ?MAX_SEND_QUEUE_BYTES - State#state.send_queue_bytes of
+                                false ->
                                     {error, send_queue_full};
-                                {NewState, BytesSent} ->
-                                    %% Advance send_offset by full DataSize (not just BytesSent),
-                                    %% because any unsent remainder was queued with correct offsets
-                                    %% and subsequent sends must not overlap.
-                                    case maps:find(StreamId, NewState#state.streams) of
-                                        {ok, UpdatedStream} ->
-                                            SendFin = (Fin andalso BytesSent =:= DataSize),
-                                            FinalStream = UpdatedStream#stream_state{
-                                                send_offset = Offset + DataSize,
-                                                send_fin = SendFin,
-                                                send_done =
-                                                    SendFin orelse
-                                                        UpdatedStream#stream_state.send_done
-                                            },
-                                            FinalState0 = NewState#state{
-                                                streams = maps:put(
-                                                    StreamId, FinalStream, NewState#state.streams
-                                                ),
-                                                data_sent = NewState#state.data_sent + BytesSent
-                                            },
-                                            %% RFC 9000 §4.6: extend MAX_STREAMS when this
-                                            %% peer-initiated stream is now fully closed.
-                                            FinalState = maybe_reclaim_stream(
-                                                StreamId, FinalState0
-                                            ),
-                                            {ok, FinalState};
-                                        error ->
-                                            {ok, NewState}
+                                true ->
+                                    %% Flow control allows sending. Congestion
+                                    %% may send a prefix and queue the remainder,
+                                    %% which now fits by construction.
+                                    case
+                                        send_stream_data_fragmented_tracked(
+                                            StreamId, Offset, Data, Fin, State
+                                        )
+                                    of
+                                        {error, send_queue_full} ->
+                                            %% Defensive only: serialized
+                                            %% pre-admission above makes this
+                                            %% unreachable for this user call.
+                                            {error, send_queue_full};
+                                        {NewState, BytesSent} ->
+                                            %% Advance send_offset by full DataSize (not just BytesSent),
+                                            %% because any unsent remainder was queued with correct offsets
+                                            %% and subsequent sends must not overlap.
+                                            case maps:find(StreamId, NewState#state.streams) of
+                                                {ok, UpdatedStream} ->
+                                                    SendFin = (Fin andalso BytesSent =:= DataSize),
+                                                    FinalStream = UpdatedStream#stream_state{
+                                                        send_offset = Offset + DataSize,
+                                                        send_fin = SendFin,
+                                                        send_done =
+                                                            SendFin orelse
+                                                                UpdatedStream#stream_state.send_done
+                                                    },
+                                                    FinalState0 = NewState#state{
+                                                        streams = maps:put(
+                                                            StreamId, FinalStream, NewState#state.streams
+                                                        ),
+                                                        data_sent = NewState#state.data_sent + BytesSent
+                                                    },
+                                                    %% RFC 9000 §4.6: extend MAX_STREAMS when this
+                                                    %% peer-initiated stream is now fully closed.
+                                                    FinalState = maybe_reclaim_stream(
+                                                        StreamId, FinalState0
+                                                    ),
+                                                    {ok, FinalState};
+                                                error ->
+                                                    {ok, NewState}
+                                            end
                                     end
                             end
                     end
@@ -8712,12 +8818,12 @@ trim_stream_send_queue(StreamId, ReliableSize, #state{send_queue = PQ} = State) 
             {[], 0, 0},
             lists:seq(1, 8)
         ),
-    State#state{
+    wake_blocked_sends(clear_blocked_send(StreamId, State#state{
         send_queue = list_to_tuple(lists:reverse(NewQueues)),
         send_queue_bytes = max(0, State#state.send_queue_bytes - RemovedBytes),
         send_queue_count = max(0, State#state.send_queue_count - RemovedCount),
         send_queue_version = State#state.send_queue_version + 1
-    }.
+    })).
 
 %% Trim one priority bucket. DCount counts fully-dropped entries only (a
 %% truncated entry stays in the queue).
@@ -9426,8 +9532,9 @@ handle_pacing_timeout(State) ->
     State1 = process_send_queue(State),
     %% If there's still queued data and pacing is blocking, set another timer
     State2 = maybe_reschedule_pacing(State1),
+    State3 = wake_blocked_sends(State2),
     %% Event-driven flush: flush batch and timers after pacing timeout processing
-    flush_dirty_timers(flush_socket_batch(State2)).
+    flush_dirty_timers(flush_socket_batch(State3)).
 
 %% Check if we need to reschedule pacing timer after processing queue
 maybe_reschedule_pacing(#state{send_queue = PQ, cc_state = CCState, pacing_enabled = true} = State) ->
@@ -11478,6 +11585,141 @@ test_zero_byte_fin_in_queue() ->
         empty_by_bytes => (State#state.send_queue_bytes =:= 0),
         queue_empty => pqueue_is_empty(State#state.send_queue)
     }.
+
+%% Drive the readiness owner without a socket. Each row uses the production
+%% blocked-size registry and readiness partition, so unrelated progress,
+%% re-registration, queue pressure, and terminal cleanup stay non-vacuous.
+-spec test_send_ready_transitions() -> map().
+test_send_ready_transitions() ->
+    Conn0 = test_ready_state(0, 0, 32, 0),
+    Conn1 = wake_blocked_sends(mark_blocked_send(0, 8, Conn0)),
+    ConnUnready =
+        not take_test_send_ready(0) andalso
+        maps:is_key(0, Conn1#state.blocked_send_streams),
+    Conn2 = wake_blocked_sends(Conn1#state{max_data_remote = 8}),
+    ConnReady =
+        take_test_send_ready(0) andalso
+        not maps:is_key(0, Conn2#state.blocked_send_streams),
+
+    %% A refused retry re-registers after the first edge. It remains parked
+    %% until the larger request itself is admissible, then receives one new edge.
+    Conn3 = wake_blocked_sends(mark_blocked_send(0, 9, Conn2)),
+    ReregisteredUnready =
+        not take_test_send_ready(0) andalso
+        maps:is_key(0, Conn3#state.blocked_send_streams),
+    Conn4 = wake_blocked_sends(Conn3#state{max_data_remote = 9}),
+    ReregisteredReady =
+        take_test_send_ready(0) andalso
+        not maps:is_key(0, Conn4#state.blocked_send_streams),
+
+    Stream0 = test_ready_state(4, 32, 0, 0),
+    Stream1 = mark_blocked_send(4, 1, Stream0),
+    OtherStream = #stream_state{send_offset = 0, send_max_data = 32},
+    Stream2 = wake_blocked_sends(
+                Stream1#state{
+                  streams = (Stream1#state.streams)#{8 => OtherStream}}),
+    OtherStreamNoWake =
+        not take_test_send_ready(4) andalso
+        maps:is_key(4, Stream2#state.blocked_send_streams),
+    BlockedStream = maps:get(4, Stream2#state.streams),
+    Stream3 = wake_blocked_sends(
+                Stream2#state{
+                  streams = (Stream2#state.streams)#{
+                    4 => BlockedStream#stream_state{send_max_data = 1}}}),
+    StreamReady =
+        take_test_send_ready(4) andalso
+        not maps:is_key(4, Stream3#state.blocked_send_streams),
+
+    Queue0 = test_ready_state(12, 32, 32,
+                              ?MAX_SEND_QUEUE_BYTES - 4),
+    Queue1 = wake_blocked_sends(mark_blocked_send(12, 8, Queue0)),
+    QueueUnready =
+        not take_test_send_ready(12) andalso
+        maps:is_key(12, Queue1#state.blocked_send_streams),
+    Queue2 = wake_blocked_sends(
+               Queue1#state{
+                 send_queue_bytes = ?MAX_SEND_QUEUE_BYTES - 8}),
+    QueueReady =
+        take_test_send_ready(12) andalso
+        not maps:is_key(12, Queue2#state.blocked_send_streams),
+
+    DequeueData = <<0, 0, 0, 0>>,
+    DequeueEntry = {stream_data, 20, 0, DequeueData, false, 4},
+    DequeuePQ = pqueue_in(DequeueEntry, 3, empty_pqueue()),
+    Dequeue0 = (test_ready_state(
+                  20, 32, 32, ?MAX_SEND_QUEUE_BYTES - 4))#state{
+                   send_queue = DequeuePQ,
+                   send_queue_count = 1,
+                   send_queue_version = 1},
+    Dequeue1 = mark_blocked_send(20, 8, Dequeue0),
+    {ok, _DequeuedFrame, Dequeue2} =
+        dequeue_small_stream_frame_tuple(Dequeue1),
+    DequeueWake =
+        take_test_send_ready(20) andalso
+        not maps:is_key(20, Dequeue2#state.blocked_send_streams),
+
+    TrimData = <<1, 1, 1, 1>>,
+    TrimEntry = {stream_data, 24, 0, TrimData, false, 4},
+    TrimPQ = pqueue_in(TrimEntry, 3, empty_pqueue()),
+    TrimWaiter = #stream_state{send_offset = 0, send_max_data = 32},
+    Trim0 = #state{
+      owner = self(),
+      max_data_remote = 32,
+      data_sent = 0,
+      streams = #{24 => #stream_state{send_offset = 0,
+                                      send_max_data = 32},
+                  28 => TrimWaiter},
+      send_queue = TrimPQ,
+      send_queue_bytes = ?MAX_SEND_QUEUE_BYTES - 4,
+      send_queue_count = 1,
+      send_queue_version = 1},
+    Trim1 = mark_blocked_send(28, 8, Trim0),
+    Trim2 = trim_stream_send_queue(24, 0, Trim1),
+    TrimWake =
+        take_test_send_ready(28) andalso
+        not maps:is_key(28, Trim2#state.blocked_send_streams),
+
+    Closed0 = test_ready_state(32, 32, 32, 0),
+    Closed1 = purge_stream_send_queue(
+                32, mark_blocked_send(32, 1, Closed0)),
+    ClosedNoWake =
+        not take_test_send_ready(32) andalso
+        not maps:is_key(32, Closed1#state.blocked_send_streams),
+
+    Cleared0 = test_ready_state(16, 32, 32, 0),
+    Cleared1 = clear_blocked_send(16, mark_blocked_send(16, 1, Cleared0)),
+    _Cleared2 = wake_blocked_sends(Cleared1),
+    TerminalClear = not take_test_send_ready(16),
+    #{connection_unready => ConnUnready,
+      connection_ready => ConnReady,
+      reregistered_unready => ReregisteredUnready,
+      reregistered_ready => ReregisteredReady,
+      other_stream_no_wake => OtherStreamNoWake,
+      stream_ready => StreamReady,
+      queue_unready => QueueUnready,
+      queue_ready => QueueReady,
+      dequeue_wake => DequeueWake,
+      trim_wake => TrimWake,
+      closed_no_wake => ClosedNoWake,
+      terminal_clear => TerminalClear}.
+
+test_ready_state(StreamId, ConnectionCredit, StreamCredit, QueueBytes) ->
+    #state{
+      owner = self(),
+      max_data_remote = ConnectionCredit,
+      data_sent = 0,
+      streams = #{StreamId =>
+                    #stream_state{send_offset = 0,
+                                  send_max_data = StreamCredit}},
+      send_queue_bytes = QueueBytes}.
+
+take_test_send_ready(StreamId) ->
+    Self = self(),
+    receive
+        {quic, Self, {send_ready, StreamId}} -> true
+    after 0 ->
+        false
+    end.
 
 test_coalesce_small_stream(DataSize) when DataSize < ?SMALL_FRAME_THRESHOLD ->
     Data = binary:copy(<<0>>, DataSize),

@@ -189,7 +189,7 @@ The owner process receives messages in the format `{quic, ConnRef, Event}`:
 | `{session_ticket, Ticket}` | Session ticket for 0-RTT resumption |
 | `{datagram, Data}` | Datagram received (RFC 9221) |
 | `{stop_sending, StreamId, ErrorCode}` | Stop sending requested by peer |
-| `{send_ready, StreamId}` | Stream ready for writing |
+| `{send_ready, StreamId}` | The exact previously refused synchronous send may be retried |
 
 ## API Reference
 
