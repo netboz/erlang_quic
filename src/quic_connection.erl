@@ -146,7 +146,6 @@
     merge_ack_ranges/1,
     convert_ack_ranges_for_encode/1,
     convert_rest_ranges/2,
-    check_send_queue_flow_control/4,
     test_check_flow_control/6,
     close_reason_to_code/1,
     %% Migration frame classification (RFC 9000 Section 9.1)
@@ -7747,8 +7746,9 @@ do_send_data_fitting(
                         ?QUIC_LOG_META
                     ),
 
-                    case {DataSize =< ConnectionAllowed, DataSize =< StreamAllowed} of
-                        {false, _} ->
+                    SendAllowance = min(ConnectionAllowed, StreamAllowed),
+                    case SendAllowance of
+                        0 when ConnectionAllowed =:= 0 ->
                             %% Connection-level flow control blocked
                             %% RFC 9000: Don't queue data beyond flow control limits.
                             %% Send DATA_BLOCKED and return error to caller.
@@ -7765,7 +7765,7 @@ do_send_data_fitting(
                             BlockedFrame = {data_blocked, MaxDataRemote},
                             _FinalState = send_frame(BlockedFrame, State),
                             {error, {flow_control_blocked, connection}};
-                        {_, false} ->
+                        0 ->
                             %% Stream-level flow control blocked
                             %% RFC 9000: Don't queue data beyond flow control limits.
                             %% Send STREAM_DATA_BLOCKED and return error to caller.
@@ -7783,7 +7783,7 @@ do_send_data_fitting(
                             BlockedFrame = {stream_data_blocked, StreamId, SendMaxData},
                             _FinalState = send_frame(BlockedFrame, State),
                             {error, {flow_control_blocked, {stream, StreamId}}};
-                        {true, true} ->
+                        _ when SendAllowance > 0 ->
                             %% Admit the whole synchronous call before emitting
                             %% any stream bytes. Its worst-case queued remainder
                             %% is no larger than DataSize, so this reservation
@@ -7798,8 +7798,13 @@ do_send_data_fitting(
                                     %% may send a prefix and queue the remainder,
                                     %% which now fits by construction.
                                     case
-                                        send_stream_data_fragmented_tracked(
-                                            StreamId, Offset, Data, Fin, State
+                                        send_stream_data_with_allowance(
+                                            StreamId,
+                                            Offset,
+                                            Data,
+                                            Fin,
+                                            SendAllowance,
+                                            State
                                         )
                                     of
                                         {error, send_queue_full} ->
@@ -7842,6 +7847,42 @@ do_send_data_fitting(
             end;
         error ->
             {error, unknown_stream}
+    end.
+
+%% Admit one application send while respecting the credit available now.  A
+%% call may be larger than the current QUIC window: send its admitted prefix
+%% and retain the remainder in the existing bounded transport queue.  Delivery
+%% then resumes from MAX_DATA/MAX_STREAM_DATA and ACK messages; the caller must
+%% not split the application frame or poll for progress.
+send_stream_data_with_allowance(StreamId, Offset, Data, Fin, Allowance, State) ->
+    DataBin =
+        case is_binary(Data) of
+            true -> Data;
+            false -> iolist_to_binary(Data)
+        end,
+    DataSize = byte_size(DataBin),
+    SendSize = min(DataSize, Allowance),
+    <<Admitted:SendSize/binary, Remainder/binary>> = DataBin,
+    AdmittedFin = Fin andalso Remainder =:= <<>>,
+    case send_stream_data_fragmented_tracked(
+           StreamId, Offset, Admitted, AdmittedFin, State) of
+        {error, send_queue_full} = Error ->
+            Error;
+        {State1, BytesSent} ->
+            case Remainder of
+                <<>> ->
+                    {State1, BytesSent};
+                _ ->
+                    case queue_stream_data(
+                           StreamId,
+                           Offset + SendSize,
+                           Remainder,
+                           Fin,
+                           State1) of
+                        {ok, State2} -> {State2, BytesSent};
+                        {error, send_queue_full} -> {error, send_queue_full}
+                    end
+            end
     end.
 
 %% Send 0-RTT (early) data on a stream
@@ -8417,11 +8458,13 @@ process_send_queue(#state{send_queue = PQ} = State) ->
             %% Use the Offset stored in the queue entry, not stream.send_offset,
             %% because send_offset may have advanced past this queued data's position.
             %% DataSize is cached in entry to avoid repeated iolist_size calls.
-            case check_send_queue_flow_control(StreamId, Offset, DataSize, State) of
-                ok ->
-                    %% Flow control allows - dequeue and try to send
-                    process_send_queue_entry(State);
-                {blocked, _Reason} ->
+            case send_queue_flow_allowance(StreamId, Offset, State) of
+                Allowance when Allowance > 0 ->
+                    %% Send the prefix admitted by current flow credit.  If the
+                    %% entry is larger, the shared helper keeps its remainder
+                    %% in this same queue for the next credit edge.
+                    process_send_queue_entry(State, min(DataSize, Allowance));
+                0 ->
                     %% Flow control blocked - leave in queue, wait for MAX_DATA
                     State
             end;
@@ -8430,42 +8473,28 @@ process_send_queue(#state{send_queue = PQ} = State) ->
             %% but still gated by congestion control via the retransmit allowance.
             case quic_cc:can_send_control(State#state.cc_state, DataSize + ?PACKET_OVERHEAD) of
                 true ->
-                    process_send_queue_entry(State);
+                    process_send_queue_entry(State, DataSize);
                 false ->
                     %% cwnd still blocking - leave queued, retried on next ACK
                     State
             end
     end.
 
-%% Check flow control limits for queued data
-%% Returns ok | {blocked, connection | {stream, StreamId}}
-%% Takes the Offset from the queue entry since stream.send_offset may have
-%% advanced past queued data positions (per PR #16 fix).
-check_send_queue_flow_control(StreamId, Offset, DataSize, #state{
+%% Return the prefix admitted by current connection and stream credit.  Use the
+%% queued entry's offset because stream.send_offset may already include data
+%% retained behind this entry.
+send_queue_flow_allowance(StreamId, Offset, #state{
     max_data_remote = MaxDataRemote,
     data_sent = DataSent,
     streams = Streams
 }) ->
     %% Check connection-level flow control
     ConnectionAllowed = MaxDataRemote - DataSent,
-    case DataSize =< ConnectionAllowed of
-        false ->
-            {blocked, connection};
-        true ->
-            %% Check stream-level flow control using the queue entry's Offset
-            case maps:find(StreamId, Streams) of
-                {ok, #stream_state{send_max_data = SendMaxData}} ->
-                    %% Data at Offset with DataSize must fit within SendMaxData
-                    case Offset + DataSize =< SendMaxData of
-                        false ->
-                            {blocked, {stream, StreamId}};
-                        true ->
-                            ok
-                    end;
-                error ->
-                    %% Stream not found - allow (will fail later)
-                    ok
-            end
+    case maps:find(StreamId, Streams) of
+        {ok, #stream_state{send_max_data = SendMaxData}} ->
+            min(max(0, ConnectionAllowed), max(0, SendMaxData - Offset));
+        error ->
+            0
     end.
 
 %% Actually process the queue entry (called after flow control check passes)
@@ -8474,7 +8503,8 @@ process_send_queue_entry(
         send_queue = PQ,
         send_queue_bytes = QueueBytes,
         send_queue_count = QueueCount
-    } = State
+    } = State,
+    Allowance
 ) ->
     case pqueue_out(PQ) of
         {empty, _} ->
@@ -8512,7 +8542,8 @@ process_send_queue_entry(
                 send_queue_bytes = DecrementedQueueBytes,
                 send_queue_count = DecrementedQueueCount
             },
-            case send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State1) of
+            case send_stream_data_with_allowance(
+                   StreamId, Offset, Data, Fin, Allowance, State1) of
                 {error, send_queue_full} ->
                     ?LOG_WARNING(
                         #{
@@ -11503,8 +11534,7 @@ test_state_for_server(RemoteAddr, Secret, ODCID) ->
 -spec test_close_reason(#state{}) -> term().
 test_close_reason(#state{close_reason = R}) -> R.
 
-%% Test helper for check_send_queue_flow_control/3.
-%% Wraps the internal function to avoid exposing #state{} record.
+%% Test the full-entry flow-control classification without exposing #state{}.
 %% RFC 9000 Section 4.1: Connection-level flow control (max_data)
 %% RFC 9000 Section 4.2: Stream-level flow control (max_stream_data)
 test_check_flow_control(StreamId, Offset, DataSize, MaxDataRemote, DataSent, StreamsMap) ->
@@ -11514,12 +11544,21 @@ test_check_flow_control(StreamId, Offset, DataSize, MaxDataRemote, DataSent, Str
         end,
         StreamsMap
     ),
-    State = #state{
-        max_data_remote = MaxDataRemote,
-        data_sent = DataSent,
-        streams = Streams
-    },
-    check_send_queue_flow_control(StreamId, Offset, DataSize, State).
+    ConnectionAllowed = MaxDataRemote - DataSent,
+    case DataSize =< ConnectionAllowed of
+        false ->
+            {blocked, connection};
+        true ->
+            case maps:find(StreamId, Streams) of
+                {ok, #stream_state{send_max_data = SendMaxData}} ->
+                    case Offset + DataSize =< SendMaxData of
+                        true -> ok;
+                        false -> {blocked, {stream, StreamId}}
+                    end;
+                error ->
+                    ok
+            end
+    end.
 
 %% Test helper for complete_migration/2.
 %% Tests that path_changed notification is sent to owner on active migration.

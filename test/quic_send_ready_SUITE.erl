@@ -9,6 +9,7 @@
          stream_credit_emits_exact_send_ready/1,
          combined_credit_emits_only_admissible_send_ready/1,
          readiness_registry_transitions_are_exact/1,
+         send_larger_than_flow_window_progresses/1,
          oversized_send_is_atomic/1,
          oversized_send_precedes_flow_control/1]).
 
@@ -16,6 +17,7 @@ all() -> [connection_credit_emits_exact_send_ready,
           stream_credit_emits_exact_send_ready,
           combined_credit_emits_only_admissible_send_ready,
           readiness_registry_transitions_are_exact,
+          send_larger_than_flow_window_progresses,
           oversized_send_is_atomic,
           oversized_send_precedes_flow_control].
 
@@ -87,6 +89,37 @@ readiness_registry_transitions_are_exact(_Config) ->
          closed_no_wake => true,
          terminal_clear => true},
        Results).
+
+send_larger_than_flow_window_progresses(_Config) ->
+    Window = 64,
+    Payload = binary:copy(<<16#5a>>, 4096),
+    {ok, Echo} = quic_test_echo_server:start(
+                   #{max_data => Window,
+                     max_stream_data_bidi_local => Window,
+                     max_stream_data_bidi_remote => Window}),
+    Port = maps:get(port, Echo),
+    try
+        {ok, Conn} = connect(Port),
+        {ok, Sid} = quic:open_stream(Conn),
+        %% The transport owns fragmentation across changing flow windows.  The
+        %% application submits its frame once and receives it exactly once.
+        ok = quic:send_data(Conn, Sid, Payload, true),
+        ?assertEqual(Payload, receive_stream(Conn, Sid, <<>>)),
+        quic:close(Conn, normal),
+        ok
+    after
+        quic_test_echo_server:stop(Echo)
+    end.
+
+receive_stream(Conn, Sid, Acc) ->
+    receive
+        {quic, Conn, {stream_data, Sid, Data, true}} ->
+            <<Acc/binary, Data/binary>>;
+        {quic, Conn, {stream_data, Sid, Data, false}} ->
+            receive_stream(Conn, Sid, <<Acc/binary, Data/binary>>)
+    after 5000 ->
+        ct:fail({large_send_stalled, byte_size(Acc)})
+    end.
 
 oversized_send_is_atomic(_Config) ->
     Window = 32 * 1024 * 1024,
