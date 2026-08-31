@@ -557,11 +557,13 @@ state_contains_fc_auto_tune_fields_test() ->
     ?assert(maps:is_key(fc_last_stream_update, Info)),
     ?assert(maps:is_key(fc_last_conn_update, Info)),
     ?assert(maps:is_key(fc_max_receive_window, Info)),
+    ?assert(maps:is_key(fc_conn_recv_window, Info)),
 
     %% Initial values
     ?assertEqual(undefined, maps:get(fc_last_stream_update, Info)),
     ?assertEqual(undefined, maps:get(fc_last_conn_update, Info)),
     ?assertEqual(?DEFAULT_MAX_RECEIVE_WINDOW, maps:get(fc_max_receive_window, Info)),
+    ?assertEqual(?DEFAULT_INITIAL_MAX_DATA, maps:get(fc_conn_recv_window, Info)),
 
     quic_connection:close(Pid, normal),
     timer:sleep(100).
@@ -600,6 +602,37 @@ fc_max_receive_window_default_test() ->
 
     quic_connection:close(Pid, normal),
     timer:sleep(100).
+
+%% Regression: MAX_DATA is an absolute offset, not a lifetime allowance. Once
+%% a connection has consumed more than the configured maximum window, the same
+%% bounded window must continue sliding instead of pinning the sender at
+%% `data_sent = max_data_remote` forever.
+connection_receive_window_slides_past_cap_test() ->
+    MaxWindow = ?DEFAULT_MAX_RECEIVE_WINDOW,
+    BytesReceived = 4 * MaxWindow - 1,
+    {NewLimit, NewWindow} =
+        quic_connection:test_advance_connection_receive_window(
+          BytesReceived, MaxWindow, MaxWindow, 0, true),
+    ?assertEqual(MaxWindow, NewWindow),
+    ?assertEqual(BytesReceived + MaxWindow, NewLimit),
+    ?assert(NewLimit > 4 * MaxWindow).
+
+%% Repeated updates must retain a bounded live window while the absolute wire
+%% limit advances without bound. The pre-fix calculation capped NewLimit at
+%% MaxWindow on its first iteration and fails this assertion immediately.
+connection_receive_window_repeatedly_slides_test() ->
+    MaxWindow = ?DEFAULT_MAX_RECEIVE_WINDOW,
+    {FinalLimit, FinalWindow} =
+        lists:foldl(
+          fun(_, {Limit, Window}) ->
+                  Consumed = Limit - (Window div 2) + 1,
+                  quic_connection:test_advance_connection_receive_window(
+                    Consumed, Window, MaxWindow, 0, false)
+          end,
+          {?DEFAULT_INITIAL_MAX_DATA, ?DEFAULT_INITIAL_MAX_DATA},
+          lists:seq(1, 20)),
+    ?assertEqual(MaxWindow, FinalWindow),
+    ?assert(FinalLimit > 8 * MaxWindow).
 
 %% Regression: the ACK-coalesce path must decrement send_queue_bytes
 %% and send_queue_count when it dequeues a small stream frame. Prior to

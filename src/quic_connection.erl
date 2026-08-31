@@ -147,6 +147,7 @@
     convert_ack_ranges_for_encode/1,
     convert_rest_ranges/2,
     test_check_flow_control/6,
+    test_advance_connection_receive_window/5,
     close_reason_to_code/1,
     %% Migration frame classification (RFC 9000 Section 9.1)
     is_probing_frame/1,
@@ -391,6 +392,10 @@
     fc_last_stream_update :: integer() | undefined,
     fc_last_conn_update :: integer() | undefined,
     fc_max_receive_window :: non_neg_integer(),
+    %% Current connection receive-window SIZE. `max_data_local` is the
+    %% absolute advertised offset and therefore cannot double as a window
+    %% size once bytes have been consumed.
+    fc_conn_recv_window :: non_neg_integer(),
     %% Cached max stream recv window (avoids O(n) scan for connection flow control)
     fc_max_stream_recv_window = ?DEFAULT_INITIAL_MAX_STREAM_DATA :: non_neg_integer(),
 
@@ -1149,6 +1154,7 @@ init({server, Opts}) ->
         fc_last_stream_update = undefined,
         fc_last_conn_update = undefined,
         fc_max_receive_window = maps:get(max_receive_window, Opts, ?DEFAULT_MAX_RECEIVE_WINDOW),
+        fc_conn_recv_window = maps:get(max_data, Opts, ?DEFAULT_INITIAL_MAX_DATA),
         % Server-initiated bidi: 1, 5, 9, ...
         next_stream_id_bidi = 1,
         % Server-initiated uni: 3, 7, 11, ...
@@ -1529,6 +1535,7 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
         fc_last_stream_update = undefined,
         fc_last_conn_update = undefined,
         fc_max_receive_window = maps:get(max_receive_window, Opts, ?DEFAULT_MAX_RECEIVE_WINDOW),
+        fc_conn_recv_window = maps:get(max_data, Opts, ?DEFAULT_INITIAL_MAX_DATA),
         % Client-initiated bidi: 0, 4, 8, ...
         next_stream_id_bidi = 0,
         % Client-initiated uni: 2, 6, 10, ...
@@ -6597,9 +6604,17 @@ do_process_stream_data_buffered(StreamId, Offset, Data, Fin, State) ->
                                     recv_max_data = NewMaxStreamData
                                 },
                                 MaxStreamDataFrame = {max_stream_data, StreamId, NewMaxStreamData},
+                                %% Cache the window SIZE, not the absolute
+                                %% stream offset advertised on the wire. Using
+                                %% the latter makes the connection allowance
+                                %% grow with lifetime bytes and eventually
+                                %% cease sliding.
+                                NewStreamWindow =
+                                    NewMaxStreamData - NewRecvOffset,
                                 %% Update cached max stream recv window
                                 NewCachedMax = max(
-                                    NewMaxStreamData, State1#state.fc_max_stream_recv_window
+                                    NewStreamWindow,
+                                    State1#state.fc_max_stream_recv_window
                                 ),
                                 State1a = State1#state{
                                     streams = maps:put(StreamId, UpdatedStream, Streams),
@@ -6611,12 +6626,18 @@ do_process_stream_data_buffered(StreamId, Offset, Data, Fin, State) ->
                                 State1
                         end,
 
-                    %% Check if we need to send MAX_DATA for connection-level flow control
-                    %% Send when we've consumed more than 50% of our advertised connection window
+                    %% Check if we need to send MAX_DATA for connection-level
+                    %% flow control. MAX_DATA is an absolute offset; the
+                    %% receive window is a size that slides over cumulative
+                    %% bytes. Comparing/capping the absolute value against the
+                    %% maximum window turns that window into a lifetime byte
+                    %% ceiling on a long-lived connection.
                     %% RTT-based auto-tuning with connection/stream multiplier enforcement
                     MaxDataLocalVal = State2#state.max_data_local,
+                    ConnWindow = State2#state.fc_conn_recv_window,
+                    ConnHeadroom = max(0, MaxDataLocalVal - NewDataReceivedVal),
                     State3 =
-                        case NewDataReceivedVal > (MaxDataLocalVal div 2) of
+                        case ConnHeadroom < (ConnWindow div 2) of
                             true ->
                                 Now2 = erlang:monotonic_time(millisecond),
                                 SmoothedRTT2 = quic_loss:smoothed_rtt(State2#state.loss_state),
@@ -6632,34 +6653,24 @@ do_process_stream_data_buffered(StreamId, Offset, Data, Fin, State) ->
                                             (Now2 - LastConnUpdate) <
                                                 (SmoothedRTT2 * ?AUTO_TUNE_RTT_FACTOR)
                                     end,
-                                %% Calculate new window based on RTT-aware growth
-                                BaseNewMaxData =
-                                    case FastConsumption2 of
-                                        true ->
-                                            %% Double (aggressive growth)
-                                            min(
-                                                (NewDataReceivedVal + MaxDataLocalVal) * 2,
-                                                MaxWindow2
-                                            );
-                                        false ->
-                                            %% Linear (conservative growth)
-                                            min(
-                                                NewDataReceivedVal + MaxDataLocalVal +
-                                                    InitialConnWindow,
-                                                MaxWindow2
-                                            )
-                                    end,
+                                %% Calculate the next window SIZE using the
+                                %% existing RTT-aware growth policy.
                                 %% Ensure connection window >= 1.5x largest stream window
                                 MaxStreamWindow = get_max_stream_recv_window(State2),
                                 MinConnWindow = trunc(
                                     MaxStreamWindow * ?CONNECTION_FLOW_CONTROL_MULTIPLIER
                                 ),
-                                NewMaxData = max(BaseNewMaxData, MinConnWindow),
+                                {NewMaxData, NewWindow} =
+                                    advance_connection_receive_window(
+                                      NewDataReceivedVal, ConnWindow,
+                                      MaxWindow2, InitialConnWindow,
+                                      MinConnWindow, FastConsumption2),
                                 MaxDataFrame = {max_data, NewMaxData},
                                 State2a = send_frame(MaxDataFrame, State2),
                                 State2a#state{
                                     max_data_local = NewMaxData,
-                                    fc_last_conn_update = Now2
+                                    fc_last_conn_update = Now2,
+                                    fc_conn_recv_window = NewWindow
                                 };
                             false ->
                                 State2
@@ -6696,6 +6707,29 @@ extract_contiguous_data(Buffer, Offset, Acc) ->
 %% Uses cached value to avoid O(n) scan on every call.
 get_max_stream_recv_window(#state{fc_max_stream_recv_window = CachedMax}) ->
     CachedMax.
+
+%% MAX_DATA carries an absolute byte offset, while flow-control tuning owns a
+%% reusable window size. Keep those concepts separate so a capped window keeps
+%% sliding for the lifetime of the connection.
+advance_connection_receive_window(
+  BytesReceived, CurrentWindow, MaxWindow, InitialWindow,
+  MinimumWindow, FastConsumption) ->
+    GrownWindow =
+        case FastConsumption of
+            true -> min(CurrentWindow * 2, MaxWindow);
+            false -> min(CurrentWindow + InitialWindow, MaxWindow)
+        end,
+    NewWindow = max(CurrentWindow, max(GrownWindow, MinimumWindow)),
+    {BytesReceived + NewWindow, NewWindow}.
+
+-ifdef(TEST).
+test_advance_connection_receive_window(
+  BytesReceived, CurrentWindow, MaxWindow, MinimumWindow,
+  FastConsumption) ->
+    advance_connection_receive_window(
+      BytesReceived, CurrentWindow, MaxWindow,
+      ?DEFAULT_INITIAL_MAX_DATA, MinimumWindow, FastConsumption).
+-endif.
 
 %%====================================================================
 %% Internal Functions - Helpers
@@ -9731,6 +9765,7 @@ state_to_map(#state{} = S) ->
         fc_last_stream_update => S#state.fc_last_stream_update,
         fc_last_conn_update => S#state.fc_last_conn_update,
         fc_max_receive_window => S#state.fc_max_receive_window,
+        fc_conn_recv_window => S#state.fc_conn_recv_window,
         idle_timer_armed => S#state.idle_timer =/= undefined,
         keep_alive_timer_armed => S#state.keep_alive_timer =/= undefined
     }.
