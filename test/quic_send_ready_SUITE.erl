@@ -4,22 +4,31 @@
 -include_lib("common_test/include/ct.hrl").
 -include_lib("stdlib/include/assert.hrl").
 
--export([all/0, init_per_suite/1, end_per_suite/1,
-         connection_credit_emits_exact_send_ready/1,
-         stream_credit_emits_exact_send_ready/1,
-         combined_credit_emits_only_admissible_send_ready/1,
-         readiness_registry_transitions_are_exact/1,
-         send_larger_than_flow_window_progresses/1,
-         oversized_send_is_atomic/1,
-         oversized_send_precedes_flow_control/1]).
+-export([
+    all/0,
+    init_per_suite/1,
+    end_per_suite/1,
+    connection_credit_emits_exact_send_ready/1,
+    stream_credit_emits_exact_send_ready/1,
+    combined_credit_emits_only_admissible_send_ready/1,
+    readiness_registry_transitions_are_exact/1,
+    send_larger_than_flow_window_progresses/1,
+    oversized_send_is_atomic/1,
+    oversized_send_precedes_flow_control/1,
+    queued_send_blocks_without_crashing/1
+]).
 
-all() -> [connection_credit_emits_exact_send_ready,
-          stream_credit_emits_exact_send_ready,
-          combined_credit_emits_only_admissible_send_ready,
-          readiness_registry_transitions_are_exact,
-          send_larger_than_flow_window_progresses,
-          oversized_send_is_atomic,
-          oversized_send_precedes_flow_control].
+all() ->
+    [
+        connection_credit_emits_exact_send_ready,
+        stream_credit_emits_exact_send_ready,
+        combined_credit_emits_only_admissible_send_ready,
+        readiness_registry_transitions_are_exact,
+        send_larger_than_flow_window_progresses,
+        oversized_send_is_atomic,
+        oversized_send_precedes_flow_control,
+        queued_send_blocks_without_crashing
+    ].
 
 init_per_suite(Config) ->
     Config.
@@ -29,24 +38,33 @@ end_per_suite(_Config) ->
 
 connection_credit_emits_exact_send_ready(_Config) ->
     assert_flow_credit_wake(
-      #{max_data => 64,
-        max_stream_data_bidi_local => 1024,
-        max_stream_data_bidi_remote => 1024}).
+        #{
+            max_data => 64,
+            max_stream_data_bidi_local => 1024,
+            max_stream_data_bidi_remote => 1024
+        }
+    ).
 
 stream_credit_emits_exact_send_ready(_Config) ->
     assert_flow_credit_wake(
-      #{max_data => 1024,
-        max_stream_data_bidi_local => 64,
-        max_stream_data_bidi_remote => 64}).
+        #{
+            max_data => 1024,
+            max_stream_data_bidi_local => 64,
+            max_stream_data_bidi_remote => 64
+        }
+    ).
 
 combined_credit_emits_only_admissible_send_ready(_Config) ->
     %% The peer advances connection and stream credit independently. A wake is
     %% correct only after the current state satisfies both; retrying immediately
     %% after the edge must therefore succeed, never re-refuse.
     assert_flow_credit_wake(
-      #{max_data => 64,
-        max_stream_data_bidi_local => 64,
-        max_stream_data_bidi_remote => 64}).
+        #{
+            max_data => 64,
+            max_stream_data_bidi_local => 64,
+            max_stream_data_bidi_remote => 64
+        }
+    ).
 
 assert_flow_credit_wake(ServerOpts) ->
     {ok, Echo} = quic_test_echo_server:start(ServerOpts),
@@ -56,8 +74,9 @@ assert_flow_credit_wake(ServerOpts) ->
         {ok, Sid} = quic:open_stream(Conn),
         ok = quic:send_data(Conn, Sid, binary:copy(<<1>>, 64), false),
         ?assertMatch(
-           {error, {flow_control_blocked, _}},
-           quic:send_data(Conn, Sid, <<2>>, false)),
+            {error, {flow_control_blocked, _}},
+            quic:send_data(Conn, Sid, <<2>>, false)
+        ),
         receive
             {quic, Conn, {send_ready, Sid}} -> ok
         after 5000 ->
@@ -76,27 +95,33 @@ assert_flow_credit_wake(ServerOpts) ->
 readiness_registry_transitions_are_exact(_Config) ->
     Results = quic_connection:test_send_ready_transitions(),
     ?assertEqual(
-       #{connection_unready => true,
-         connection_ready => true,
-         reregistered_unready => true,
-         reregistered_ready => true,
-         other_stream_no_wake => true,
-         stream_ready => true,
-         queue_unready => true,
-         queue_ready => true,
-         dequeue_wake => true,
-         trim_wake => true,
-         closed_no_wake => true,
-         terminal_clear => true},
-       Results).
+        #{
+            connection_unready => true,
+            connection_ready => true,
+            reregistered_unready => true,
+            reregistered_ready => true,
+            other_stream_no_wake => true,
+            stream_ready => true,
+            queue_unready => true,
+            queue_ready => true,
+            dequeue_wake => true,
+            trim_wake => true,
+            closed_no_wake => true,
+            terminal_clear => true
+        },
+        Results
+    ).
 
 send_larger_than_flow_window_progresses(_Config) ->
     Window = 64,
     Payload = binary:copy(<<16#5a>>, 4096),
     {ok, Echo} = quic_test_echo_server:start(
-                   #{max_data => Window,
-                     max_stream_data_bidi_local => Window,
-                     max_stream_data_bidi_remote => Window}),
+        #{
+            max_data => Window,
+            max_stream_data_bidi_local => Window,
+            max_stream_data_bidi_remote => Window
+        }
+    ),
     Port = maps:get(port, Echo),
     try
         {ok, Conn} = connect(Port),
@@ -124,9 +149,12 @@ receive_stream(Conn, Sid, Acc) ->
 oversized_send_is_atomic(_Config) ->
     Window = 32 * 1024 * 1024,
     {ok, Echo} = quic_test_echo_server:start(
-                   #{max_data => Window,
-                     max_stream_data_bidi_local => Window,
-                     max_stream_data_bidi_remote => Window}),
+        #{
+            max_data => Window,
+            max_stream_data_bidi_local => Window,
+            max_stream_data_bidi_remote => Window
+        }
+    ),
     Port = maps:get(port, Echo),
     try
         {ok, Conn} = connect(Port),
@@ -136,8 +164,9 @@ oversized_send_is_atomic(_Config) ->
         %% packets on the wire and then roll its state back with this error.
         Oversized = binary:copy(<<16#aa>>, 16 * 1024 * 1024 + 1),
         ?assertEqual(
-           {error, send_too_large},
-           quic:send_data(Conn, Sid, Oversized, false)),
+            {error, send_too_large},
+            quic:send_data(Conn, Sid, Oversized, false)
+        ),
         receive
             {quic, Conn, {stream_data, Sid, Prefix, _}} ->
                 ct:fail({oversized_prefix_escaped, byte_size(Prefix)});
@@ -171,17 +200,21 @@ oversized_send_precedes_flow_control(_Config) ->
     %% current flow credit, an impossible request must not masquerade as a
     %% transient flow refusal and register a wake that can never make it fit.
     {ok, Echo} = quic_test_echo_server:start(
-                   #{max_data => 64,
-                     max_stream_data_bidi_local => 64,
-                     max_stream_data_bidi_remote => 64}),
+        #{
+            max_data => 64,
+            max_stream_data_bidi_local => 64,
+            max_stream_data_bidi_remote => 64
+        }
+    ),
     Port = maps:get(port, Echo),
     try
         {ok, Conn} = connect(Port),
         {ok, Sid} = quic:open_stream(Conn),
         Oversized = binary:copy(<<16#bb>>, 16 * 1024 * 1024 + 1),
         ?assertEqual(
-           {error, send_too_large},
-           quic:send_data(Conn, Sid, Oversized, false)),
+            {error, send_too_large},
+            quic:send_data(Conn, Sid, Oversized, false)
+        ),
         receive
             {quic, Conn, {send_ready, Sid}} ->
                 ct:fail(permanent_oversize_registered_for_wake)
@@ -194,10 +227,66 @@ oversized_send_precedes_flow_control(_Config) ->
         quic_test_echo_server:stop(Echo)
     end.
 
+queued_send_blocks_without_crashing(_Config) ->
+    Parent = self(),
+    Handler = fun(Server, _) ->
+        ok = quic:set_owner_sync(Server, Parent),
+        Parent ! {server_connection, Server},
+        {ok, Parent}
+    end,
+    {ok, Echo} = quic_test_echo_server:start(
+        #{
+            max_data => 1024,
+            max_stream_data_bidi_local => 64,
+            max_stream_data_bidi_remote => 64,
+            connection_handler => Handler
+        }
+    ),
+    try
+        {ok, Conn} = connect(maps:get(port, Echo)),
+        Server =
+            receive
+                {server_connection, S} -> S
+            after 5000 ->
+                ct:fail(no_server_connection)
+            end,
+        %% Hold the real peer before it can grant credit. The accepted send
+        %% reserves 128 bytes while only 64 can leave the existing queue.
+        ok = sys:suspend(Server),
+        try
+            {ok, Sid} = quic:open_stream(Conn),
+            Payload = binary:copy(<<1>>, 128),
+            ok = quic:send_data(Conn, Sid, Payload, false),
+            ?assertEqual(
+                {error, {flow_control_blocked, {stream, Sid}}},
+                quic:send_data(Conn, Sid, <<2>>, false)
+            ),
+            ?assert(is_process_alive(Conn)),
+            ok = sys:resume(Server),
+            receive
+                {quic, Conn, {send_ready, Sid}} -> ok
+            after 5000 ->
+                ct:fail(no_send_ready_after_queued_send)
+            end,
+            %% Only the refused byte is submitted again. The previously
+            %% accepted payload drains exactly once through the transport.
+            ok = quic:send_data(Conn, Sid, <<2>>, true),
+            ?assertEqual(<<Payload/binary, 2>>, receive_stream(Server, Sid, <<>>))
+        after
+            catch sys:resume(Server),
+            quic:close(Conn, normal)
+        end
+    after
+        quic_test_echo_server:stop(Echo)
+    end.
+
 connect(Port) ->
     {ok, Conn} = quic:connect(
-                   "127.0.0.1", Port,
-                   #{verify => false, alpn => [<<"echo">>]}, self()),
+        "127.0.0.1",
+        Port,
+        #{verify => false, alpn => [<<"echo">>]},
+        self()
+    ),
     receive
         {quic, Conn, {connected, _}} -> {ok, Conn}
     after 5000 ->
