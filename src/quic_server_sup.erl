@@ -73,9 +73,10 @@ start_server(Name, Port, Opts) when is_atom(Name), is_integer(Port), is_map(Opts
 stop_server(Name) when is_atom(Name) ->
     case supervisor:terminate_child(?MODULE, Name) of
         ok ->
-            _ = supervisor:delete_child(?MODULE, Name),
-            %% Unregister is handled by registry monitor
-            ok;
+            case supervisor:delete_child(?MODULE, Name) of
+                ok -> quic_server_registry:unregister_stopped(Name);
+                Error -> Error
+            end;
         {error, not_found} ->
             {error, {not_found, Name}}
     end.

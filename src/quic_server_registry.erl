@@ -32,6 +32,7 @@
     start_link/0,
     register/4,
     unregister/1,
+    unregister_stopped/1,
     lookup/1,
     list/0,
     get_port/1,
@@ -73,6 +74,11 @@ register(Name, Pid, Port, Opts) ->
 -spec unregister(atom()) -> ok.
 unregister(Name) ->
     gen_server:call(?MODULE, {unregister, Name}).
+
+%% @doc Complete shutdown registration cleanup without retiring a live replacement.
+-spec unregister_stopped(atom()) -> ok.
+unregister_stopped(Name) ->
+    gen_server:call(?MODULE, {unregister_stopped, Name}).
 
 %% @doc Look up a server by name.
 -spec lookup(atom()) -> {ok, map()} | {error, not_found}.
@@ -179,6 +185,7 @@ init([]) ->
     {ok, #state{}}.
 
 handle_call({register, Name, Pid, Port, Opts}, _From, State = #state{monitors = Monitors}) ->
+    KeptMonitors = clear_monitors(Name, Monitors),
     %% Monitor the server process
     MonRef = erlang:monitor(process, Pid),
 
@@ -191,24 +198,24 @@ handle_call({register, Name, Pid, Port, Opts}, _From, State = #state{monitors = 
     },
     true = ets:insert(?TABLE, {Name, Info}),
 
-    NewMonitors = Monitors#{MonRef => Name},
+    NewMonitors = KeptMonitors#{MonRef => Name},
     {reply, ok, State#state{monitors = NewMonitors}};
-handle_call({unregister, Name}, _From, State = #state{monitors = Monitors}) ->
-    %% Find and remove the monitor
-    case ets:lookup(?TABLE, Name) of
-        [{Name, #{pid := Pid}}] ->
-            %% Find the monitor reference for this pid
-            MonRef = find_monitor_by_pid(Pid, Monitors),
-            case MonRef of
-                undefined -> ok;
-                _ -> erlang:demonitor(MonRef, [flush])
-            end,
-            true = ets:delete(?TABLE, Name),
-            NewMonitors = maps:filter(fun(_, V) -> V =/= Name end, Monitors),
-            {reply, ok, State#state{monitors = NewMonitors}};
-        [] ->
-            {reply, ok, State}
-    end;
+handle_call({unregister, Name}, _From, State) ->
+    {reply, ok, remove_registration(Name, State)};
+handle_call({unregister_stopped, Name}, _From, State) ->
+    %% A new server may register after the old child was deleted. The registry
+    %% owns this check and deletion together, so late cleanup cannot erase it.
+    NextState =
+        case lookup(Name) of
+            {ok, #{pid := Pid}} ->
+                case is_process_alive(Pid) of
+                    true -> State;
+                    false -> remove_registration(Name, State)
+                end;
+            {error, not_found} ->
+                State
+        end,
+    {reply, ok, NextState};
 handle_call({update_port, Name, Port}, _From, State) ->
     {reply, do_update_port(Name, Port), State};
 handle_call(_Request, _From, State) ->
@@ -226,15 +233,18 @@ do_update_port(Name, Port) ->
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
-handle_info({'DOWN', MonRef, process, _Pid, _Reason}, State = #state{monitors = Monitors}) ->
+handle_info({'DOWN', MonRef, process, Pid, _Reason}, State = #state{monitors = Monitors}) ->
     %% Server terminated, remove from registry
     case maps:get(MonRef, Monitors, undefined) of
         undefined ->
             {noreply, State};
         Name ->
-            true = ets:delete(?TABLE, Name),
-            NewMonitors = maps:remove(MonRef, Monitors),
-            {noreply, State#state{monitors = NewMonitors}}
+            case lookup(Name) of
+                {ok, #{pid := Pid}} ->
+                    {noreply, remove_registration(Name, State)};
+                _ ->
+                    {noreply, State#state{monitors = maps:remove(MonRef, Monitors)}}
+            end
     end;
 handle_info(_Info, State) ->
     {noreply, State}.
@@ -246,21 +256,21 @@ terminate(_Reason, _State) ->
 %% Internal functions
 %%====================================================================
 
-find_monitor_by_pid(Pid, Monitors) ->
-    %% Find monitor reference by pid - need to check the registered info
-    maps:fold(
-        fun(MonRef, Name, Acc) ->
-            case Acc of
-                undefined ->
-                    case ets:lookup(?TABLE, Name) of
-                        [{Name, #{pid := Pid}}] -> MonRef;
-                        _ -> undefined
-                    end;
-                _ ->
-                    Acc
+remove_registration(Name, State = #state{monitors = Monitors}) ->
+    true = ets:delete(?TABLE, Name),
+    State#state{monitors = clear_monitors(Name, Monitors)}.
+
+clear_monitors(Name, Monitors) ->
+    maps:filter(
+        fun(MonRef, RegisteredName) ->
+            case RegisteredName =:= Name of
+                true ->
+                    erlang:demonitor(MonRef, [flush]),
+                    false;
+                false ->
+                    true
             end
         end,
-        undefined,
         Monitors
     ).
 

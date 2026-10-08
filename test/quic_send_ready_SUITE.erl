@@ -15,7 +15,9 @@
     send_larger_than_flow_window_progresses/1,
     oversized_send_is_atomic/1,
     oversized_send_precedes_flow_control/1,
-    queued_send_blocks_without_crashing/1
+    queued_send_blocks_without_crashing/1,
+    stopped_server_name_is_reusable/1,
+    stale_registry_death_preserves_replacement/1
 ]).
 
 all() ->
@@ -27,7 +29,9 @@ all() ->
         send_larger_than_flow_window_progresses,
         oversized_send_is_atomic,
         oversized_send_precedes_flow_control,
-        queued_send_blocks_without_crashing
+        queued_send_blocks_without_crashing,
+        stopped_server_name_is_reusable,
+        stale_registry_death_preserves_replacement
     ].
 
 init_per_suite(Config) ->
@@ -278,6 +282,114 @@ queued_send_blocks_without_crashing(_Config) ->
         end
     after
         quic_test_echo_server:stop(Echo)
+    end.
+
+stopped_server_name_is_reusable(_Config) ->
+    {ok, Echo} = quic_test_echo_server:start(),
+    Name = maps:get(name, Echo),
+    {ok, #{pid := Old, opts := Opts}} = quic_server_registry:lookup(Name),
+    Registry = whereis(quic_server_registry),
+    Parent = self(),
+    Ref = make_ref(),
+    %% Forward calls to the real registry while holding its mailbox. This
+    %% makes the historical gap after stop deterministic without sleeps.
+    Proxy = spawn(fun() -> registry_proxy(Registry, Parent, Ref) end),
+    true = unregister(quic_server_registry),
+    true = register(quic_server_registry, Proxy),
+    ok = sys:suspend(Registry),
+    {Worker, Monitor} = spawn_monitor(fun() ->
+        ok = quic:stop_server(Name),
+        Parent ! {stop_returned, Ref, quic_server_registry:lookup(Name)}
+    end),
+    try
+        Observed =
+            receive
+                {registry_call, Ref} ->
+                    ok = sys:resume(Registry),
+                    receive
+                        {stop_returned, Ref, Result} -> Result
+                    after 5000 -> ct:fail(stop_did_not_complete)
+                    end;
+                {stop_returned, Ref, Result} ->
+                    Result
+            after 5000 -> ct:fail(stop_did_not_reach_registry)
+            end,
+        Summary =
+            case Observed of
+                {ok, #{pid := Owner}} -> {ok, Owner};
+                Other -> Other
+            end,
+        ?assertEqual({error, not_found}, Summary),
+        true = unregister(quic_server_registry),
+        true = register(quic_server_registry, Registry),
+        {ok, New} = quic:start_server(Name, 0, Opts),
+        ?assertNotEqual(Old, New),
+        ?assertMatch({ok, #{pid := New}}, quic_server_registry:lookup(Name)),
+        ok = quic:stop_server(Name),
+        ?assertEqual({error, not_found}, quic_server_registry:lookup(Name))
+    after
+        catch sys:resume(Registry),
+        case whereis(quic_server_registry) of
+            Proxy ->
+                true = unregister(quic_server_registry),
+                true = register(quic_server_registry, Registry);
+            Registry ->
+                ok
+        end,
+        exit(Proxy, kill),
+        exit(Worker, kill),
+        receive
+            {'DOWN', Monitor, process, Worker, _} -> ok
+        after 5000 -> ct:fail(stop_worker_not_closed)
+        end,
+        quic_test_echo_server:stop(Echo)
+    end.
+
+registry_proxy(Registry, Parent, Ref) ->
+    receive
+        {'$gen_call', _, _} = Message ->
+            Parent ! {registry_call, Ref},
+            Registry ! Message,
+            registry_proxy(Registry, Parent, Ref)
+    end.
+
+stale_registry_death_preserves_replacement(_Config) ->
+    Name = stale_registry_owner,
+    Old = spawn(fun() ->
+        receive
+            stop -> ok
+        end
+    end),
+    New = spawn(fun() ->
+        receive
+            stop -> ok
+        end
+    end),
+    Registry = whereis(quic_server_registry),
+    try
+        ok = quic_server_registry:register(Name, Old, 1234, #{}),
+        {state, Monitors} = sys:get_state(Registry),
+        [OldRef] = [R || {R, N} <- maps:to_list(Monitors), N =:= Name],
+        ok = quic_server_registry:register(Name, New, 1234, #{}),
+        exit(Old, kill),
+        %% A delayed genuine reference from the previous owner is harmless.
+        Registry ! {'DOWN', OldRef, process, Old, killed},
+        _ = sys:get_state(Registry),
+        ?assertMatch({ok, #{pid := New}}, quic_server_registry:lookup(Name)),
+        ok = quic_server_registry:unregister_stopped(Name),
+        ?assertMatch({ok, #{pid := New}}, quic_server_registry:lookup(Name)),
+        NewMonitor = erlang:monitor(process, New),
+        exit(New, kill),
+        receive
+            {'DOWN', NewMonitor, process, New, killed} -> ok
+        after 5000 -> ct:fail(replacement_not_stopped)
+        end,
+        ok = quic_server_registry:unregister_stopped(Name),
+        ?assertEqual({error, not_found}, quic_server_registry:lookup(Name))
+    after
+        exit(Old, kill),
+        exit(New, kill),
+        quic_server_registry:unregister(Name)
     end.
 
 connect(Port) ->
